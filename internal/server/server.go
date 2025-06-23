@@ -1,24 +1,47 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync/atomic"
+
+	"github.com/blexram-go/httpfromtcp/internal/request"
+	"github.com/blexram-go/httpfromtcp/internal/response"
 )
 
+type Handler func(w io.Writer, req *request.Request) *HandlerError
+
+type HandlerError struct {
+	StatusCode response.StatusCode
+	Message    string
+}
+
+func (he HandlerError) Write(w io.Writer) {
+	response.WriteStatusLine(w, he.StatusCode)
+	msgBytes := []byte(he.Message)
+	headers := response.GetDefaultHeaders(len(msgBytes))
+	response.WriteHeaders(w, headers)
+	w.Write(msgBytes)
+}
+
+// Server is an HTTP 1.1 server
 type Server struct {
 	listener net.Listener
+	handler  Handler
 	closed   atomic.Bool
 }
 
-func Serve(port int) (*Server, error) {
+func Serve(port int, handler Handler) (*Server, error) {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return nil, err
 	}
 	s := &Server{
 		listener: listener,
+		handler:  handler,
 	}
 	go s.listen()
 	return s, nil
@@ -48,11 +71,25 @@ func (s *Server) listen() {
 
 func (s *Server) handle(conn net.Conn) {
 	defer conn.Close()
-	response := "HTTP/1.1 200 OK\r\n" + // Status line
-		"Content-Length: 0\r\n" + // Example header
-		"Connection: close\r\n" + // Example headers
-		"Content-Type: text/plain\r\n" + // Example header
-		"\r\n" // Blank line to separate headers from the body
-	conn.Write([]byte(response))
+	req, err := request.RequestFromReader(conn)
+	if err != nil {
+		hErr := &HandlerError{
+			StatusCode: response.StatusCodeBadRequest,
+			Message:    err.Error(),
+		}
+		hErr.Write(conn)
+		return
+	}
+	buf := bytes.NewBuffer([]byte{})
+	hErr := s.handler(buf, req)
+	if hErr != nil {
+		hErr.Write(conn)
+		return
+	}
+	b := buf.Bytes()
+	response.WriteStatusLine(conn, response.StatusCodeOK)
+	headers := response.GetDefaultHeaders(len(b))
+	response.WriteHeaders(conn, headers)
+	conn.Write(b)
 	return
 }
